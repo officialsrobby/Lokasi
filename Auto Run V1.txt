@@ -1,0 +1,1237 @@
+-- ==========================================================
+-- 1️⃣ BAGIAN 1: INISIALISASI & KONFIGURASI UTAMA
+-- ==========================================================
+
+task.wait(1.0) 
+
+local player = game.Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local runService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService") 
+local starterGui = game:GetService("StarterGui") 
+local UserInputService = game:GetService("UserInputService") 
+local SocialService = game:GetService("SocialService") 
+
+-- ⚠️ KONFIGURASI JSON
+local JSON_PAGE_SIZE = 15000 
+-- Perekaman sekarang berdasarkan Perubahan State (Posisi/Orientasi/Jump) di setiap Heartbeat, bukan jarak minimum.
+
+-- VARIABEL KONTROL UTAMA
+local MOVEMENT_RECORD = {}  
+local IS_RECORDING = false
+local IS_PLAYBACK = false
+local currentPlaybackFrame = 1
+local recordConnection = nil
+local playbackConnection = nil 
+local IS_BUTTON_LOCKED = false 
+local IS_JUMP_PRESSED = false 
+local JSON_POPUP = nil 
+local LAST_EDITED_JSON = "" 
+local JSON_PAGES = {}       
+local SaveFileName = "SavedG.json" 
+
+-- Variabel GUI Global (Akan diisi di Bagian 6)
+local KEY_ACCESS_GUI 
+local MAIN_CONTROL_GUI 
+local viewJsonBtn, recordBtn, playBtn 
+local IS_MINIMIZED = false
+local FRAME_HEIGHT_FULL = 170 
+local FRAME_HEIGHT_MINIMIZED = 30 
+local ACTIVE_KEY_EXPIRY_MS = 0 
+local VALID_KEY_SAVE_FILE = "Valid_Key_" .. player.Name .. ".json" 
+local KEY_VALIDITY_MS = 12 * 60 * 60 * 1000 -- 12 jam dalam milidetik
+
+-- Modul Kontrol Karakter
+local ControlModule = nil
+local PlayerModule = playerGui:FindFirstChild("PlayerModule") or playerGui:WaitForChild("PlayerModule", 5)
+
+if PlayerModule then
+    local success, result = pcall(function()
+        return require(PlayerModule:WaitForChild("ControlModule"))
+    end)
+    if success and result and result.SetEnabled then
+        ControlModule = result
+    end
+end
+-- ==========================================================
+-- 2️⃣ BAGIAN 2: FUNGSI UTILITAS & LOGIKA JSON
+-- ==========================================================
+
+-- FUNGSI BANTUAN & NOTIFIKASI
+local function notify(title, text, duration, iconId)
+    starterGui:SetCore("SendNotification", {
+        Title = title,
+        Text = text,
+        Duration = duration or 3,
+        Icon = iconId or "rbxassetid://6376283901" 
+    })
+end
+
+local function toggleMovementControls(isEnabled)
+    if ControlModule and ControlModule.SetEnabled then
+        ControlModule:SetEnabled(isEnabled) 
+    end
+    game.Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+end
+
+local function setButtonText(btn, text)
+    if btn then btn.Text = text end
+end
+
+local function roundToTenth(value)
+    return math.floor(value * 10 + 0.5) / 10
+end
+
+local function activatePlayButton(frameCount)
+    if playBtn then
+        playBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
+        playBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        setButtonText(playBtn, "Putar Ulang (" .. (frameCount or #MOVEMENT_RECORD) .. " F)")
+    end
+end
+
+-- FUNGSI PEMBAGIAN DAN PENGELOLAAN DATA JSON
+local function splitJson(fullJsonString)
+    JSON_PAGES = {}
+    local len = #fullJsonString
+    local numPages = math.ceil(len / JSON_PAGE_SIZE)
+    
+    if numPages == 0 then
+        table.insert(JSON_PAGES, fullJsonString)
+        return
+    end
+
+    for i = 1, numPages do
+        local start = (i - 1) * JSON_PAGE_SIZE + 1
+        local finish = math.min(i * JSON_PAGE_SIZE, len)
+        
+        table.insert(JSON_PAGES, string.sub(fullJsonString, start, finish))
+    end
+end
+
+-- FUNGSI SAVE LOKAL
+local function saveG()
+    if writefile and LAST_EDITED_JSON and #LAST_EDITED_JSON > 0 then
+        local success, err = pcall(function()
+            writefile(SaveFileName, LAST_EDITED_JSON)
+        end)
+        
+        if success then
+            notify("Penyimpanan Berhasil!", "Data rekaman disimpan ke " .. SaveFileName .. " di folder exploit Anda.", 4)
+            return true
+        else
+            notify("Penyimpanan Gagal!", "Gagal menulis ke file. Error: " .. tostring(err), 5)
+            return false
+        end
+    elseif not writefile then
+        notify("Gagal Simpan!", "Fungsi 'writefile' tidak ditemukan. Fitur ini hanya untuk executor.", 5)
+    else
+        notify("Gagal Simpan!", "Tidak ada data JSON untuk disimpan.", 3)
+    end
+    return false
+end
+
+-- Variabel Dragging untuk Pop-up JSON
+local isDraggingJson = false
+local dragStartPosJson = Vector2.new(0, 0)
+local frameToDragJson = nil 
+
+-- FUNGSI UTAMA POPUP JSON
+local function displayJsonPopup(recordTable, isNewRecord, startPage)
+    
+    local textToProcess = LAST_EDITED_JSON 
+    
+    if isNewRecord then
+        local successEncode, encodedString = pcall(function()
+            return HttpService:JSONEncode(recordTable) 
+        end)
+        
+        if successEncode then
+             textToProcess = encodedString
+             LAST_EDITED_JSON = textToProcess 
+             splitJson(textToProcess)
+        else
+             notify("Error Encode", "Gagal meng-encode rekaman menjadi JSON.", 5)
+        end
+    end
+    
+    if textToProcess ~= "" and #JSON_PAGES == 0 then splitJson(textToProcess) end
+    if JSON_POPUP and JSON_POPUP.Parent then JSON_POPUP:Destroy() end
+
+    local activePage = startPage or 1
+    if #JSON_PAGES == 0 then activePage = 1 
+    elseif activePage > #JSON_PAGES or activePage < 1 then activePage = 1 end
+    
+    local content = JSON_PAGES[activePage] or "Tidak ada data JSON untuk ditampilkan. Silakan rekam pergerakan terlebih dahulu."
+    local numPages = #JSON_PAGES
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "JsonCopyPopup"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = playerGui
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0.6, 0, 0.7, 0) 
+    frame.Position = UDim2.new(0.5, 0, 0.5, 0)
+    frame.AnchorPoint = Vector2.new(0.5, 0.5)
+    frame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    frame.BorderSizePixel = 0
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+    frame.Parent = screenGui
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 30)
+    
+    local titleText = "DATA REKAMAN (Salin Manual)"
+    if numPages > 0 then titleText = "DATA REKAMAN (Bagian " .. activePage .. "/" .. numPages .. ")" end
+    title.Text = titleText
+    
+    title.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Font = Enum.Font.SourceSansBold
+    title.Parent = frame
+
+    -- LOGIKA DRAGGING UNTUK POPUP JSON 
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            isDraggingJson = true
+            frameToDragJson = frame
+            dragStartPosJson = Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(frameToDragJson.AbsolutePosition.X, frameToDragJson.AbsolutePosition.Y)
+            input.UseProcessedInput = true
+        end
+    end)
+    
+    UserInputService.InputChanged:Connect(function(input)
+        if isDraggingJson and frameToDragJson and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType.Touch) then
+            local newPos = input.Position - dragStartPosJson
+            frameToDragJson.Position = UDim2.new(0, newPos.X, 0, newPos.Y)
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            isDraggingJson = false
+            frameToDragJson = nil
+        end
+    end)
+    -- -----------------------------------------------------------------
+
+    local buttonHeight = 30 
+    local saveLocalBtn = Instance.new("TextButton")
+    saveLocalBtn.Size = UDim2.new(0.48, 0, 0, buttonHeight) 
+    saveLocalBtn.Position = UDim2.new(0, 0, 1, -buttonHeight) 
+    saveLocalBtn.Text = "💾 Simpan ke File Lokal"
+    saveLocalBtn.BackgroundColor3 = Color3.fromRGB(200, 100, 0)
+    saveLocalBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    saveLocalBtn.Font = Enum.Font.SourceSansBold
+    saveLocalBtn.Parent = frame
+    saveLocalBtn.MouseButton1Click:Connect(saveG) 
+    
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0.48, 0, 0, buttonHeight) 
+    closeBtn.Position = UDim2.new(0.52, 0, 1, -buttonHeight) 
+    closeBtn.Text = "Tutup"
+    closeBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.Font = Enum.Font.SourceSansBold
+    closeBtn.Parent = frame
+    
+    -- SCROLLING FRAME PAGINATION
+    local paginationHeight = 35 
+    local buttonAreaTotalHeight = buttonHeight + 5 
+    
+    local pageScrollFrame = Instance.new("ScrollingFrame")
+    pageScrollFrame.Size = UDim2.new(1, -20, 0, paginationHeight)
+    pageScrollFrame.Position = UDim2.new(0, 10, 1, -buttonAreaTotalHeight - paginationHeight) 
+    pageScrollFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    pageScrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    pageScrollFrame.ScrollingDirection = Enum.ScrollingDirection.X
+    pageScrollFrame.Parent = frame
+
+    local pageLayout = Instance.new("UIListLayout")
+    pageLayout.FillDirection = Enum.FillDirection.Horizontal
+    pageLayout.Padding = UDim.new(0, 5)
+    pageLayout.Parent = pageScrollFrame
+    
+    local totalButtonsWidth = 0
+   
+    for i = 1, numPages do
+        local pageBtn = Instance.new("TextButton")
+        pageBtn.Size = UDim2.new(0, 60, 1, 0)
+        pageBtn.Text = "Data " .. i
+        pageBtn.Font = Enum.Font.SourceSansBold
+        pageBtn.BackgroundColor3 = (i == activePage) and Color3.fromRGB(0, 100, 200) or Color3.fromRGB(50, 50, 50)
+        pageBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        pageBtn.Parent = pageScrollFrame
+        
+        totalButtonsWidth = totalButtonsWidth + 60 + 5 
+        
+        pageBtn.MouseButton1Click:Connect(function()
+            displayJsonPopup(MOVEMENT_RECORD, false, i) 
+        end)
+    end
+    
+    pageScrollFrame.CanvasSize = UDim2.new(0, totalButtonsWidth, 0, 0)
+
+    -- TEXTBOX UTAMA (Input Area)
+    local textbox = Instance.new("TextBox")
+    local textboxHeightOffset = 30 + paginationHeight + buttonAreaTotalHeight 
+    textbox.Size = UDim2.new(1, -20, 1, -textboxHeightOffset) 
+    textbox.Position = UDim2.new(0, 10, 0, 40) 
+    textbox.Text = content 
+    textbox.MultiLine = true
+    textbox.TextEditable = true
+    textbox.TextWrapped = true
+    textbox.TextXAlignment = Enum.TextXAlignment.Left
+    textbox.TextYAlignment = Enum.TextYAlignment.Top
+    textbox.ClearTextOnFocus = false
+    textbox.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    textbox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    textbox.Font = Enum.Font.SourceSans
+    textbox.Parent = frame
+    
+    closeBtn.MouseButton1Click:Connect(function()
+        local currentText = textbox.Text
+        local dataLoadedSuccessfully = false
+        local totalFrames = 0
+        
+        local successDecode, dataTable = pcall(function()
+            local trimmedText = string.match(currentText, "^%s*(.-)%s*$") or currentText
+            return HttpService:JSONDecode(trimmedText) 
+        end)
+
+        if successDecode and typeof(dataTable) == "table" and #dataTable > 0 then
+            MOVEMENT_RECORD = dataTable 
+            LAST_EDITED_JSON = currentText 
+            splitJson(currentText)         
+            totalFrames = #dataTable
+            dataLoadedSuccessfully = true
+        end
+        
+        if dataLoadedSuccessfully then
+            activatePlayButton(totalFrames) 
+        elseif #MOVEMENT_RECORD > 0 then
+            activatePlayButton(#MOVEMENT_RECORD)
+        else
+            setButtonText(playBtn, "Putar Ulang (0 F)")
+        end
+       
+        screenGui:Destroy()
+        JSON_POPUP = nil
+        IS_BUTTON_LOCKED = false 
+    end)
+
+    JSON_POPUP = screenGui
+    
+    if isNewRecord and numPages > 1 then
+        notify("Rekaman Selesai!", "Data dibagi menjadi " .. numPages .. " bagian. Salin secara manual dari tiap bagian.", 5)
+    end
+
+    task.wait(0.1)
+    textbox:CaptureFocus()
+    textbox.SelectionStart = 0
+    textbox.SelectionEnd = #textbox.Text
+end
+
+-- ==========================================================
+-- 3️⃣ BAGIAN 3: LOGIKA PEREKAMAN (startRecording) - STATE-BASED
+-- ==========================================================
+
+-- FUNGSI UTAMA RECORD (SUDAH DIPERBAIKI LOGIKA JUMP DAN MENGGUNAKAN PERUBAHAN STATE)
+local function startRecording()
+    if IS_BUTTON_LOCKED or IS_PLAYBACK then 
+        notify("Tombol Terkunci", "Harap tunggu proses sebelumnya selesai.", 3)
+        return 
+    end
+
+    local char = player.Character 
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char and char:FindFirstChild("Humanoid")
+    if not root or not humanoid then return end
+
+    IS_BUTTON_LOCKED = true 
+    
+    if IS_RECORDING then
+        -- === BLOK STOP RECORDING ===
+        IS_RECORDING = false
+        if recordConnection then recordConnection:Disconnect() end 
+        toggleMovementControls(true)
+        
+        local totalFrames = #MOVEMENT_RECORD
+        if totalFrames > 0 then
+             local successEncode, encodedString = pcall(function()
+                 return HttpService:JSONEncode(MOVEMENT_RECORD) 
+             end)
+             if successEncode then LAST_EDITED_JSON = encodedString end
+        end
+       
+        setButtonText(recordBtn, "Mulai Rekam (Record)")
+        displayJsonPopup(MOVEMENT_RECORD, true, 1) 
+        
+    else
+        -- === BLOK START RECORDING ===
+        IS_RECORDING = true
+        MOVEMENT_RECORD = {} 
+        currentPlaybackFrame = 1
+
+        toggleMovementControls(true) 
+        
+        setButtonText(recordBtn, "🔴 MEREKAM...")
+        setButtonText(playBtn, "Putar Ulang (0 F)") 
+        
+        local initialPos = root.CFrame.Position
+        local initialLook = root.CFrame.LookVector
+        
+        -- Rekam frame pertama (frame 1)
+        table.insert(MOVEMENT_RECORD, {
+            X = roundToTenth(initialPos.X),
+            Y = roundToTenth(initialPos.Y),
+            Z = roundToTenth(initialPos.Z),
+            LX = roundToTenth(initialLook.X),
+            LY = roundToTenth(initialLook.Y),
+            LZ = roundToTenth(initialLook.Z),
+            Jump = IS_JUMP_PRESSED, 
+        })
+        
+        notify("Mulai Rekam!", "Perekaman pergerakan Anda sedang berlangsung. Frame hanya direkam saat ada perubahan.", 3)
+        
+        recordConnection = runService.Heartbeat:Connect(function(deltaTime)
+            local currentRoot = char:FindFirstChild("HumanoidRootPart")
+            local currentHumanoid = char:FindFirstChild("Humanoid")
+            if not currentRoot or not currentHumanoid then startRecording(); return end
+
+            local pos = currentRoot.CFrame.Position
+            local look = currentRoot.CFrame.LookVector 
+            
+            local lastFrame = MOVEMENT_RECORD[#MOVEMENT_RECORD]
+
+            -- Tentukan state frame saat ini
+            local recordState = {
+                X = roundToTenth(pos.X),
+                Y = roundToTenth(pos.Y),
+                Z = roundToTenth(pos.Z),
+                
+                LX = roundToTenth(look.X),
+                LY = roundToTenth(look.Y),
+                LZ = roundToTenth(look.Z),
+                
+                Jump = IS_JUMP_PRESSED, 
+            }
+
+            -- Cek apakah ada perubahan (Posisi, Orientasi, ATAU status Jump)
+            local hasStateChanged = not lastFrame or
+                                    recordState.X ~= lastFrame.X or recordState.Y ~= lastFrame.Y or recordState.Z ~= lastFrame.Z or
+                                    recordState.LX ~= lastFrame.LX or recordState.LY ~= lastFrame.LY or recordState.LZ ~= lastFrame.LZ or
+                                    recordState.Jump ~= lastFrame.Jump
+
+            if hasStateChanged then
+                
+                -- Logika khusus untuk update Jump=false (Landing atau lepas tombol tanpa pergerakan)
+                local isJumpFalseUpdate = lastFrame and 
+                                          not IS_JUMP_PRESSED and 
+                                          lastFrame.Jump and 
+                                          recordState.X == lastFrame.X and recordState.Y == lastFrame.Y and recordState.Z == lastFrame.Z and
+                                          recordState.LX == lastFrame.LX and recordState.LY == lastFrame.LY and recordState.LZ == lastFrame.LZ
+
+                if isJumpFalseUpdate then
+                    -- Hanya update status Jump pada frame terakhir (untuk landing/lepas tombol yang cepat)
+                    lastFrame.Jump = false
+                else
+                    -- Jika ada pergerakan, perubahan Orientasi, atau Jump=true, masukkan frame baru
+                    table.insert(MOVEMENT_RECORD, recordState)
+                end
+            end
+        end)
+
+        IS_BUTTON_LOCKED = false 
+    end
+end
+
+
+-- ==========================================================
+-- 4️⃣ BAGIAN 4: LOGIKA PLAYBACK (startPlayback) - DIREVISI UNTUK JUMP + CFRAME 5 FRAME
+-- ==========================================================
+
+-- FUNGSI MENCARI FRAME TERDEKAT DENGAN BATAS JARAK MINIMUM (1.0 STUD)
+local function findClosestFrame()
+    local char = player.Character 
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root or #MOVEMENT_RECORD == 0 then return 1 end
+
+    local MIN_DISTANCE_SQ = 1.0^2 -- Minimal 1.0 stud agar MoveTo terpicu lebih baik/konsisten (untuk start)
+    local currentPos = root.CFrame.Position
+    local closestDistanceSq = math.huge
+    local closestIndex = 1
+    local foundValidFrame = false
+
+    for i, frameData in ipairs(MOVEMENT_RECORD) do
+        local framePos = Vector3.new(frameData.X, frameData.Y, frameData.Z)
+        local distanceSq = (currentPos - framePos).Magnitude^2 
+
+        -- Kriteria 1: Jarak harus lebih besar dari MIN_DISTANCE_SQ (1.0 stud)
+        -- Kriteria 2: Harus lebih dekat dari frame terdekat yang sudah ditemukan
+        if distanceSq >= MIN_DISTANCE_SQ and distanceSq < closestDistanceSq then
+            closestDistanceSq = distanceSq
+            closestIndex = i
+            foundValidFrame = true
+        end
+    end
+    
+    -- Fallback ke awal rekaman jika tidak ada frame > 1.0 stud yang terdeteksi
+    if not foundValidFrame then
+         return 1 
+    end
+
+    return closestIndex
+end
+
+
+-- FUNGSI UTAMA PLAYBACK
+local function startPlayback()
+    
+    local char = player.Character 
+    local humanoid = char and char:FindFirstChild("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+
+    if not humanoid or not root then return end
+
+    if IS_RECORDING then 
+        notify("🚫 Gagal Putar", "Harap hentikan perekaman terlebih dahulu.", 2)
+        return 
+    end
+    
+    if IS_PLAYBACK then
+        -- LOGIKA STOP PLAYBACK MANUAL
+        IS_PLAYBACK = false
+        
+        toggleMovementControls(true) 
+        humanoid.WalkSpeed = 16 
+        
+        notify("Playback Dihentikan!", "Kontrol karakter dikembalikan.", 3)
+        activatePlayButton(#MOVEMENT_RECORD)
+        
+        IS_BUTTON_LOCKED = false 
+        return
+    end
+    
+    if #MOVEMENT_RECORD == 0 and #LAST_EDITED_JSON == 0 then
+        notify("🚫 Gagal Putar", "Harap rekam pergerakan terlebih dahulu.", 3)
+        setButtonText(playBtn, "Putar Ulang (0 F)")
+        return
+    end
+
+    if IS_BUTTON_LOCKED then 
+        notify("Tombol Terkunci", "Harap tunggu proses sebelumnya selesai.", 3)
+        return 
+    end
+    
+    local MIN_PLAYBACK_MOVE_SQ = 5.0^2 -- Batas minimum 5.0 stud untuk MoveTo selama playback (Ditetapkan 5.0)
+    
+    IS_BUTTON_LOCKED = true 
+    IS_PLAYBACK = true
+    
+    -- 🔄 MENGATUR FRAME AWAL KE TITIK TERDEKAT (1.0 STUD)
+    currentPlaybackFrame = findClosestFrame()
+
+    
+    humanoid.WalkSpeed = 16 
+
+    toggleMovementControls(false) 
+    
+    notify("Mulai Playback!", "Memulai dari titik terdekat (Frame " .. currentPlaybackFrame .. "/" .. #MOVEMENT_RECORD .. ").", 3)
+
+    -- MENGGANTI HEARTBEAT DENGAN TASK.SPAWN UNTUK MENANGANI FUNGSI YIELDING (:Wait())
+    playbackConnection = task.spawn(function()
+        while IS_PLAYBACK and currentPlaybackFrame <= #MOVEMENT_RECORD do
+            
+            local startPosition = root.Position
+            local targetFrameIndex = currentPlaybackFrame
+            
+            local finalFrameData = nil
+            local indexToMoveTo = -1
+            
+            -- Variabel baru untuk menandai apakah target yang ditemukan adalah awal dari urutan Jump
+            local isTargetAJumpStart = false 
+            local jumpStartIndex = -1
+            
+            -- 1. Cari frame berikutnya: prioritaskan Move Jauh (> 5.0 stud) atau Jump
+            for i = targetFrameIndex, #MOVEMENT_RECORD do
+                local checkFrame = MOVEMENT_RECORD[i]
+                local checkPos = Vector3.new(checkFrame.X, checkFrame.Y, checkFrame.Z)
+                local distanceSq = (checkPos - startPosition).Magnitude^2
+                local isJumpFrame = checkFrame.Jump
+                
+                -- Kriteria A: Jarak cukup jauh (>= 5.0 stud) -> Target untuk MoveTo
+                if distanceSq >= MIN_PLAYBACK_MOVE_SQ then
+                    indexToMoveTo = i
+                    finalFrameData = checkFrame
+                    isTargetAJumpStart = false
+                    break 
+                end
+                
+                -- Kriteria B: Terdapat Jump=true, DAN bukan frame pertama dari siklus playback ini
+                if isJumpFrame and i > targetFrameIndex then
+                    -- 🛑 TARGET MOVE ADALAH FRAME SEBELUM JUMP 🛑
+                    indexToMoveTo = i - 1 
+                    finalFrameData = MOVEMENT_RECORD[indexToMoveTo] 
+                    
+                    isTargetAJumpStart = true
+                    jumpStartIndex = i -- Index frame awal Jump sebenarnya
+                    
+                    -- Jika MoveTo target (i-1) terlalu dekat dengan posisi start, 
+                    -- kita set indexToMoveTo ke targetFrameIndex untuk memastikan MoveTo setidaknya dipicu.
+                    if indexToMoveTo < targetFrameIndex then 
+                        indexToMoveTo = targetFrameIndex 
+                        finalFrameData = MOVEMENT_RECORD[targetFrameIndex]
+                    end
+                    
+                    break
+                end
+                
+                -- Kriteria C: Frame Terakhir (Meskipun jarak dekat/tidak ada jump) -> Target
+                if i == #MOVEMENT_RECORD then
+                    indexToMoveTo = i
+                    finalFrameData = checkFrame
+                    isTargetAJumpStart = false
+                    break 
+                end
+            end
+
+            -- Jika target tidak ditemukan, keluar dari loop
+            if not finalFrameData then break end
+       
+            -- Tampilkan Frame saat ini
+            if indexToMoveTo == 1 or indexToMoveTo % 60 == 0 then
+                 setButtonText(playBtn, "⏸️ " .. indexToMoveTo .. "/" .. #MOVEMENT_RECORD)
+            end
+            
+            -- 2. Tentukan posisi dan orientasi MoveTo
+            local newPosition = Vector3.new(finalFrameData.X, finalFrameData.Y, finalFrameData.Z)
+            local newLookVector = Vector3.new(finalFrameData.LX, finalFrameData.LY, finalFrameData.LZ)
+
+            -- Atur orientasi awal sebelum MoveTo
+            root.CFrame = CFrame.new(root.Position, root.Position + newLookVector)
+            
+            -- LAKUKAN MOVE & TUNGGU HINGGA SELESAI
+            humanoid:MoveTo(newPosition)
+            local reachedTarget = humanoid.MoveToFinished:Wait(3) 
+                
+            if not reachedTarget and IS_PLAYBACK then
+                notify("MoveTo Timeout", "MoveTo gagal/timeout pada frame " .. indexToMoveTo, 2)
+            end
+            
+            -- 3. Cek apakah tujuan MoveTo ini adalah untuk memulai Jump
+            if isTargetAJumpStart and jumpStartIndex > -1 then
+                
+                -- Update Frame awal ke frame Jump
+                currentPlaybackFrame = jumpStartIndex 
+                
+                -- Tampilkan status Jump
+                setButtonText(playBtn, "⬆️ JUMP " .. currentPlaybackFrame .. "/" .. #MOVEMENT_RECORD)
+                
+                -- A. Aktifkan Jump
+                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+                task.wait(3) -- Jeda pendek
+                
+                -- B. CFrame Control for at least 5 frames
+                local cframeEndIndex = math.min(jumpStartIndex + 10, #MOVEMENT_RECORD)
+                
+                -- Lakukan CFrame dari frame awal Jump hingga minimal 5 frame
+                for j = jumpStartIndex, cframeEndIndex do
+                    local frame = MOVEMENT_RECORD[j]
+                    local pos = Vector3.new(frame.X, frame.Y, frame.Z)
+                    local look = Vector3.new(frame.LX, frame.LY, frame.LZ)
+                    
+                    -- Force position and orientation via CFrame
+                    root.CFrame = CFrame.new(pos, pos + look)
+                    
+                    -- Jeda kecil untuk simulasi framerate (Heartbeat)
+                    task.wait() 
+                    
+                    currentPlaybackFrame = j
+                    if j == #MOVEMENT_RECORD then break end
+                end
+                
+                -- C. Lanjutkan ke frame berikutnya setelah CFrame selesai
+                currentPlaybackFrame = currentPlaybackFrame + 1
+            else
+                -- 4. Jika bukan Jump, lanjutkan ke frame berikutnya setelah MoveTo selesai
+                currentPlaybackFrame = indexToMoveTo + 1
+            end
+        end
+        
+        -- Playback selesai secara otomatis (jika IS_PLAYBACK masih true)
+        if IS_PLAYBACK then 
+             IS_PLAYBACK = false 
+             toggleMovementControls(true)
+             humanoid.WalkSpeed = 16 
+             notify("Playback Selesai!", "Kontrol karakter dikembalikan.", 3)
+             activatePlayButton(#MOVEMENT_RECORD)
+             IS_BUTTON_LOCKED = false 
+        end
+    end)
+    
+end
+
+-- ==========================================================
+-- 5️⃣ BAGIAN 5: LOGIKA KUNCI AKSES & FUNGSI WAKTU
+-- ==========================================================
+
+-- 🛑 LIST 20 KEY VALID (MASTER LIST) 🛑
+local VALID_KEYS_TABLE = {
+    "DX-A3Z1-Q7B4", "DX-W5C9-G2H8", "DX-L0F6-R1J3", "DX-P9M4-T6K2", "DX-D7V3-S5X0",
+    "DX-E8Y2-N4U1", "DX-B6T5-A0Q9", "DX-K1J3-Z7C4", "DX-H4G0-W8F6", "DX-R2L9-V5D7",
+    "DX-X0E7-B3P5", "DX-M8U1-T9S4", "DX-N6Q2-Y0R3", "DX-P5D4-L1X7", "DX-V3G8-A6Z2",
+    "DX-W9B5-H2J0", "DX-C7F1-K4N8", "DX-S0R6-E9M3", "DX-T2H7-W4V5", "DX-U1X4-G6Q9" 
+}
+
+-- 🌐 LIST 20 ACCESS KEY URL (DIPILIH RANDOM SAAT KLIK) 🌐
+local ACCESS_KEY_URLS = {
+    "https://keyaccess.dev/link/QZ-102-M", "https://keyaccess.dev/link/RY-314-N", "https://keyaccess.dev/link/TV-526-P", 
+    "https://keyaccess.dev/link/WA-738-S", "https://keyaccess.dev/link/XB-940-T", "https://keyaccess.dev/link/ZC-151-V", 
+    "https://keyaccess.dev/link/AD-362-W", "https://keyaccess.dev/link/BE-573-Y", "https://keyaccess.dev/link/CF-784-Z", 
+    "https://keyaccess.dev/link/DG-995-A", "https://keyaccess.dev/link/EH-106-B", "https://keyaccess.dev/link/FI-317-C", 
+    "https://keyaccess.dev/link/GJ-528-D", "https://keyaccess.dev/link/HK-739-E", "https://keyaccess.dev/link/IL-940-F", 
+    "https://keyaccess.dev/link/JM-151-G", "https://keyaccess.dev/link/KN-362-H", "https://keyaccess.dev/link/LO-573-I", 
+    "https://keyaccess.dev/link/MP-784-J", "https://keyaccess.dev/link/NQ-995-K" 
+}
+
+-- FUNGSI UNTUK MENYIMPAN KEY YANG BERHASIL DIAKSES DENGAN WAKTU KEDALUWARSA
+local function saveValidKey(key)
+    if not writefile then
+        notify("Penyimpanan Gagal!", "Fungsi 'writefile' tidak ditemukan. Key tidak dapat disimpan.", 5)
+        return false
+    end
+    
+    local currentTimeMs = math.floor(os.time() * 1000) -- Waktu saat ini (ms)
+    local expiryTimeMs = currentTimeMs + KEY_VALIDITY_MS -- Waktu kedaluwarsa
+    ACTIVE_KEY_EXPIRY_MS = expiryTimeMs -- Update variabel global
+
+    local keyData = {
+        {
+            savedTime = currentTimeMs,
+            expiresAfter = expiryTimeMs,
+            key = key
+        }
+    }
+    
+    local successEncode, jsonString = pcall(function()
+        return HttpService:JSONEncode(keyData)
+    end)
+    
+    if not successEncode then
+        notify("Penyimpanan Gagal!", "Gagal meng-encode data key ke JSON.", 5)
+        return false
+    end
+    
+    local successWrite, err = pcall(function()
+        writefile(VALID_KEY_SAVE_FILE, jsonString)
+    end)
+    
+    if successWrite then
+        return true
+    else
+        notify("Penyimpanan Gagal!", "Gagal menulis ke file. Error: " .. tostring(err), 5)
+        return false
+    end
+end
+
+-- FUNGSI UNTUK MEMBACA KEY YANG TELAH DISIMPAN
+local function readValidKey()
+    if not readfile then return nil end
+    
+    local successRead, jsonString = pcall(function()
+        return readfile(VALID_KEY_SAVE_FILE)
+    end)
+    
+    if not successRead or not jsonString or #jsonString == 0 then return nil end
+
+    local successDecode, keyData = pcall(function()
+        return HttpService:JSONDecode(jsonString)
+    end)
+    
+    if successDecode and typeof(keyData) == "table" and keyData[1] then
+        return keyData[1]
+    end
+    
+    return nil
+end
+
+-- FUNGSI UNTUK MENGHITUNG DAN MEMFORMAT WAKTU SISA
+local function getRemainingTimeText(expiryMs)
+    local currentTimeMs = math.floor(os.time() * 1000)
+    local remainingMs = expiryMs - currentTimeMs
+    
+    if remainingMs <= 0 then
+        return "Key Expired. Harap Akses Key Baru."
+    end
+    
+    local remainingSeconds = math.floor(remainingMs / 1000)
+    
+    local hours = math.floor(remainingSeconds / 3600)
+    local minutes = math.floor((remainingSeconds % 3600) / 60)
+    local seconds = remainingSeconds % 60
+    
+    local text = "Sisa Waktu: "
+    
+    if hours > 0 then
+        text = text .. string.format("%02d jam %02d menit", hours, minutes)
+    elseif minutes > 0 then
+        text = text .. string.format("%02d menit %02d detik", minutes, seconds)
+    else
+        text = text .. string.format("00 menit %02d detik", seconds)
+    end
+    
+    return text
+end
+
+-- ==========================================================
+-- 6️⃣ BAGIAN 6: SETUP GUI KONTROL UTAMA & KUNCI AKSES & KONEKSI INPUT
+-- ==========================================================
+
+local function setupMainControls()
+    
+    if playerGui:FindFirstChild("RecordPlaybackControl") then
+        playerGui:FindFirstChild("RecordPlaybackControl"):Destroy()
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "RecordPlaybackControl"
+    gui.ResetOnSpawn = false 
+    gui.Enabled = false 
+    gui.Parent = playerGui 
+    
+    MAIN_CONTROL_GUI = gui 
+
+    local INITIAL_DISABLED_COLOR = Color3.fromRGB(80, 80, 80)
+    local PLAY_DEFAULT_COLOR = Color3.fromRGB(0, 150, 0) 
+    
+    -- FRAME UTAMA MENU KONTROL
+    local mainFrame = Instance.new("Frame")
+    local FRAME_HEIGHT_MINIMIZED_WITH_LABEL = FRAME_HEIGHT_MINIMIZED + 20 + 5 
+    mainFrame.Size = UDim2.new(0, 330, 0, FRAME_HEIGHT_FULL) 
+    mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0) 
+    mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+    mainFrame.BorderSizePixel = 0
+    Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+    mainFrame.Parent = gui
+    
+    local header = Instance.new("TextLabel")
+    header.Size = UDim2.new(1, 0, 0, FRAME_HEIGHT_MINIMIZED)
+    header.Text = "⏯️ Macro Controller V1.0"
+    header.BackgroundTransparency = 0 
+    header.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    header.TextColor3 = Color3.fromRGB(255, 255, 255)
+    header.Font = Enum.Font.SourceSansBold
+    header.Parent = mainFrame
+    
+    -- LABEL WAKTU EXPIRED
+    local expiryLabel = Instance.new("TextLabel")
+    expiryLabel.Size = UDim2.new(1, -20, 0, 20)
+    expiryLabel.Position = UDim2.new(0, 10, 0, FRAME_HEIGHT_MINIMIZED + 5)
+    expiryLabel.Text = "Waktu Kedaluwarsa: Memuat..."
+    expiryLabel.BackgroundTransparency = 1
+    expiryLabel.TextColor3 = Color3.fromRGB(255, 200, 0) 
+    expiryLabel.TextXAlignment = Enum.TextXAlignment.Left
+    expiryLabel.Font = Enum.Font.SourceSansSemibold
+    expiryLabel.TextSize = 14
+    expiryLabel.Parent = mainFrame
+    
+    
+    -- LOOP RUNSERVICE UNTUK UPDATE WAKTU REAL-TIME
+    local expiryConnection = runService.Heartbeat:Connect(function()
+        if ACTIVE_KEY_EXPIRY_MS > 0 then
+            local timeText = getRemainingTimeText(ACTIVE_KEY_EXPIRY_MS)
+            expiryLabel.Text = timeText
+            
+            if timeText == "Key Expired. Harap Akses Key Baru." then
+                expiryConnection:Disconnect()
+                if MAIN_CONTROL_GUI then MAIN_CONTROL_GUI:Destroy() end
+                notify("Sesi Berakhir", "Waktu key Anda telah habis. Meminta key akses baru.", 5)
+                local setupKeyAccessGUI = getfenv().setupKeyAccessGUI 
+                if setupKeyAccessGUI then setupKeyAccessGUI() end 
+            end
+        end
+    end)
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 30, 1, 0)
+    closeBtn.Position = UDim2.new(1, -30, 0, 0)
+    closeBtn.Text = "X"
+    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.Font = Enum.Font.SourceSansBold
+    closeBtn.Parent = header
+    closeBtn.MouseButton1Click:Connect(function()
+        if expiryConnection then expiryConnection:Disconnect() end
+        mainFrame.Parent = nil
+        gui:Destroy()
+        notify("Tutup Menu", "Menu kontrol Macro telah ditutup.", 2)
+    end)
+
+    local minimizeBtn = Instance.new("TextButton")
+    minimizeBtn.Size = UDim2.new(0, 30, 1, 0)
+    minimizeBtn.Position = UDim2.new(1, -60, 0, 0)
+    minimizeBtn.Text = "—"
+    minimizeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    minimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    minimizeBtn.Font = Enum.Font.SourceSansBold
+    minimizeBtn.Parent = header
+
+    -- KONTEN FRAME
+    local contentFrame = Instance.new("Frame")
+    contentFrame.Size = UDim2.new(1, 0, 1, -(FRAME_HEIGHT_MINIMIZED_WITH_LABEL))
+    contentFrame.Position = UDim2.new(0, 0, 0, FRAME_HEIGHT_MINIMIZED_WITH_LABEL)
+    contentFrame.BackgroundTransparency = 1
+    contentFrame.Parent = mainFrame
+
+    local function toggleMinimize()
+        if IS_MINIMIZED then
+            IS_MINIMIZED = false
+            mainFrame:TweenSize(UDim2.new(0, 330, 0, FRAME_HEIGHT_FULL), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.2, true)
+            minimizeBtn.Text = "—"
+            contentFrame.Visible = true
+            expiryLabel.Visible = true
+        else
+            IS_MINIMIZED = true
+            mainFrame:TweenSize(UDim2.new(0, 330, 0, FRAME_HEIGHT_MINIMIZED), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.2, true)
+            minimizeBtn.Text = "◻"
+            task.wait(0.15)
+            contentFrame.Visible = false
+            expiryLabel.Visible = false
+        end
+    end
+
+    minimizeBtn.MouseButton1Click:Connect(toggleMinimize)
+
+    -- Logika Dragging (di header)
+    local isDragging = false
+    local dragStartPos = Vector2.new(0, 0)
+    local frameToDrag = nil
+
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if input.Target == minimizeBtn or input.Target == closeBtn then return end
+            isDragging = true
+            frameToDrag = mainFrame
+            dragStartPos = Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(frameToDrag.AbsolutePosition.X, frameToDrag.AbsolutePosition.Y)
+            input.UseProcessedInput = true
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if isDragging and frameToDrag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType.Touch) then
+            local newPos = input.Position - dragStartPos
+            frameToDrag.Position = UDim2.new(0, newPos.X, 0, newPos.Y)
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            isDragging = false
+            frameToDrag = nil
+        end
+    end)
+
+    local paddingY = 10
+    local buttonHeight = 40
+
+    -- View Json Button
+    viewJsonBtn = Instance.new("TextButton")
+    viewJsonBtn.Size = UDim2.new(1, -20, 0, buttonHeight)
+    viewJsonBtn.Position = UDim2.new(0, 10, 0, paddingY)
+    viewJsonBtn.Text = "Memuat Data... (Tunggu)"
+    viewJsonBtn.BackgroundColor3 = INITIAL_DISABLED_COLOR
+    viewJsonBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+    Instance.new("UICorner", viewJsonBtn).CornerRadius = UDim.new(0, 5)
+    viewJsonBtn.Parent = contentFrame
+
+    -- Record Button
+    recordBtn = Instance.new("TextButton")
+    recordBtn.Size = UDim2.new(0.5, -15, 0, buttonHeight)
+    recordBtn.Position = UDim2.new(0, 10, 0, paddingY + buttonHeight + 10)
+    recordBtn.Text = "Mulai Rekam (Tunggu)"
+    recordBtn.BackgroundColor3 = INITIAL_DISABLED_COLOR
+    recordBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+    Instance.new("UICorner", recordBtn).CornerRadius = UDim.new(0, 5)
+    recordBtn.Parent = contentFrame
+
+    -- Play Button
+    playBtn = Instance.new("TextButton")
+    playBtn.Size = UDim2.new(0.5, -15, 0, buttonHeight)
+    playBtn.Position = UDim2.new(0.5, 5, 0, paddingY + buttonHeight + 10)
+    playBtn.Text = "Putar Ulang (Tunggu)"
+    playBtn.BackgroundColor3 = PLAY_DEFAULT_COLOR
+    playBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Instance.new("UICorner", playBtn).CornerRadius = UDim.new(0, 5)
+    playBtn.Parent = contentFrame
+
+    -- KONEKSI TOMBOL
+    viewJsonBtn.MouseButton1Click:Connect(function()
+        if IS_BUTTON_LOCKED or IS_RECORDING or IS_PLAYBACK then
+            notify("Tombol Terkunci", "Harap tunggu proses sebelumnya selesai.", 3)
+            return
+        end
+        if #LAST_EDITED_JSON == 0 and #MOVEMENT_RECORD == 0 then
+            notify("Informasi", "Tidak ada data rekaman untuk ditampilkan. Coba rekam dulu.", 3)
+            return
+        end
+        IS_BUTTON_LOCKED = true
+        displayJsonPopup(MOVEMENT_RECORD, false, 1)
+    end)
+
+    recordBtn.MouseButton1Click:Connect(startRecording)
+    playBtn.MouseButton1Click:Connect(startPlayback)
+
+    -- Logika INISIALISASI/AWAL
+    notify("Akses Diberikan.", "Skrip rekaman siap. Mulai merekam untuk mengaktifkan Play.", 2)
+    IS_BUTTON_LOCKED = false
+    MOVEMENT_RECORD = {}
+    LAST_EDITED_JSON = ""
+    -- Set Warna Akhir
+    viewJsonBtn.BackgroundColor3 = Color3.fromRGB(0, 50, 150)
+    viewJsonBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    setButtonText(viewJsonBtn, "Lihat/Edit/Copy Data JSON")
+    recordBtn.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
+    recordBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    setButtonText(recordBtn, "Mulai Rekam (Record)")
+    setButtonText(playBtn, "Putar Ulang (0 F)")
+
+    -- 🟢 AKTIFKAN GUI SETELAH SEMUA KOMPONEN SIAP 🟢
+    gui.Enabled = true
+end
+
+-- ==========================================================
+-- SETUP GUI KUNCI AKSES & EKSEKUSI AWAL
+-- ==========================================================
+
+function setupKeyAccessGUI() -- Didefinisikan sebagai fungsi global
+    if playerGui:FindFirstChild("KeyAccessGUI") then
+        playerGui:FindFirstChild("KeyAccessGUI"):Destroy()
+    end
+
+    -- 1. CEK KEY TERSIMPAN (OTOMATIS)
+    local savedData = readValidKey()
+    if savedData and savedData.key and savedData.expiresAfter then
+        local savedKey = savedData.key
+        local expiresAfterMs = savedData.expiresAfter
+
+        -- Cek 1: Key Match di Master List
+        local isKeyInTable = false
+        for _, validCode in ipairs(VALID_KEYS_TABLE) do
+            if savedKey == validCode then
+                isKeyInTable = true
+                break
+            end
+        end
+
+        if isKeyInTable then
+            -- Cek 2: Waktu Kedaluwarsa
+            local currentTimeMs = math.floor(os.time() * 1000)
+            if currentTimeMs < expiresAfterMs then
+                ACTIVE_KEY_EXPIRY_MS = expiresAfterMs
+                local remainingMs = expiresAfterMs - currentTimeMs
+                local remainingHours = math.floor(remainingMs / 3600000)
+                setupMainControls() -- Panggil setup GUI utama
+                return
+            else
+                notify("Key Expired", "Key tersimpan sudah kedaluwarsa, harap masukkan key baru.", 4)
+            end
+        else
+            notify("Key Expired", "Key tersimpan sudah tidak valid, harap masukkan key baru.", 4)
+        end
+    end
+
+    -- ... (Logika Key Access GUI) ...
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "KeyAccessGUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = playerGui
+    KEY_ACCESS_GUI = screenGui
+
+    local frame = Instance.new("Frame")
+    local FRAME_HEIGHT_KEY = 195
+    frame.Size = UDim2.new(0, 280, 0, FRAME_HEIGHT_KEY + 35)
+    frame.Position = UDim2.new(0.5, 0, 0.5, 0)
+    frame.AnchorPoint = Vector2.new(0.5, 0.5)
+    frame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    frame.BorderSizePixel = 0
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+    frame.Parent = screenGui
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 30)
+    title.Text = "🔑 Masukkan Key Akses 🔑"
+    title.BackgroundTransparency = 0
+    title.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Font = Enum.Font.SourceSansBold
+    title.Parent = frame
+
+    -- Tombol Tutup/Minimize
+    local closeKeyBtn = Instance.new("TextButton")
+    closeKeyBtn.Size = UDim2.new(0, 30, 1, 0)
+    closeKeyBtn.Position = UDim2.new(1, -30, 0, 0)
+    closeKeyBtn.Text = "X"
+    closeKeyBtn.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
+    closeKeyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeKeyBtn.Font = Enum.Font.SourceSansBold
+    closeKeyBtn.Parent = title
+    closeKeyBtn.MouseButton1Click:Connect(function()
+        screenGui:Destroy()
+        notify("Akses Ditolak", "Menu Key Access ditutup.", 2)
+    end)
+
+    -- Logika Dragging Key Access
+    local isDraggingKey = false
+    local dragStartPosKey = Vector2.new(0, 0)
+    local frameToDragKey = nil
+    
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if input.Target == closeKeyBtn then return end
+            isDraggingKey = true
+            frameToDragKey = frame
+            dragStartPosKey = Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(frameToDragKey.AbsolutePosition.X, frameToDragKey.AbsolutePosition.Y)
+            input.UseProcessedInput = true
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if isDraggingKey and frameToDragKey and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType.Touch) then
+            local newPos = input.Position - dragStartPosKey
+            frameToDragKey.Position = UDim2.new(0, newPos.X, 0, newPos.Y)
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            isDraggingKey = false
+            frameToDragKey = nil
+        end
+    end)
+
+    local infoLabel = Instance.new("TextLabel")
+    infoLabel.Size = UDim2.new(1, -20, 0, 30)
+    infoLabel.Position = UDim2.new(0, 10, 0, 35)
+    infoLabel.Text = "Akses key diperlukan untuk menggunakan Macro. Klik tombol 'Akses Key' untuk mendapatkan key 12 jam."
+    infoLabel.BackgroundTransparency = 1
+    infoLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    infoLabel.TextSize = 12
+    infoLabel.TextWrapped = true
+    infoLabel.Font = Enum.Font.SourceSans
+    infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+    infoLabel.Parent = frame
+
+    local keyBox = Instance.new("TextBox")
+    keyBox.Size = UDim2.new(1, -20, 0, 40)
+    keyBox.Position = UDim2.new(0, 10, 0, 75)
+    keyBox.PlaceholderText = "Masukkan Key (misal: DX-A1B2-C3D4)"
+    keyBox.Text = ""
+    keyBox.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    keyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    keyBox.TextSize = 18
+    keyBox.ClearTextOnFocus = false
+    Instance.new("UICorner", keyBox).CornerRadius = UDim.new(0, 5)
+    keyBox.Parent = frame
+
+    local getKeyBtn = Instance.new("TextButton")
+    getKeyBtn.Size = UDim2.new(0.48, 0, 0, 40)
+    getKeyBtn.Position = UDim2.new(0, 10, 0, 125)
+    getKeyBtn.Text = "Akses Key (Linkvertise)"
+    getKeyBtn.BackgroundColor3 = Color3.fromRGB(0, 100, 200)
+    getKeyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    getKeyBtn.Font = Enum.Font.SourceSansBold
+    Instance.new("UICorner", getKeyBtn).CornerRadius = UDim.new(0, 5)
+    getKeyBtn.Parent = frame
+
+    local submitBtn = Instance.new("TextButton")
+    submitBtn.Size = UDim2.new(0.48, 0, 0, 40)
+    submitBtn.Position = UDim2.new(0.52, 0, 0, 125)
+    submitBtn.Text = "Akses (12 Jam)"
+    submitBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
+    submitBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    submitBtn.Font = Enum.Font.SourceSansBold
+    Instance.new("UICorner", submitBtn).CornerRadius = UDim.new(0, 5)
+    submitBtn.Parent = frame
+
+    local contactLabel = Instance.new("TextLabel")
+    contactLabel.Size = UDim2.new(1, -20, 0, 20)
+    contactLabel.Position = UDim2.new(0, 10, 0, 175)
+    contactLabel.Text = "Jika ada masalah: Hubungi Support"
+    contactLabel.BackgroundTransparency = 1
+    contactLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+    contactLabel.TextSize = 12
+    contactLabel.Font = Enum.Font.SourceSans
+    contactLabel.Parent = frame
+    
+    getKeyBtn.MouseButton1Click:Connect(function()
+        local randomIndex = math.random(1, #ACCESS_KEY_URLS)
+        local url = ACCESS_KEY_URLS[randomIndex]
+        SocialService:PromptGamePassPurchase(player, 0, url) -- Menggunakan prompt lain sebagai fallback, namun URL di-copy
+        notify("Akses Key", "Link key telah dibuka di browser Anda. Harap ikuti langkah-langkahnya.", 4)
+        setclipboard(url) 
+    end)
+    
+    local function checkKey()
+        local inputKey = keyBox.Text
+        local isValid = false
+        for _, validCode in ipairs(VALID_KEYS_TABLE) do
+            if inputKey == validCode then
+                isValid = true
+                break
+            end
+        end
+
+        if isValid then
+            saveValidKey(inputKey)
+            submitBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0)
+            submitBtn.Text = "Key Diterima! Memuat..."
+            notify("Akses Berhasil!", "Key valid. Akses diberikan selama 12 jam.", 3)
+            task.delay(1.5, function()
+                if KEY_ACCESS_GUI then KEY_ACCESS_GUI:Destroy() end
+                setupMainControls()
+            end)
+        else
+            submitBtn.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
+            submitBtn.Text = "Key Salah! Coba Lagi."
+            notify("Akses Ditolak", "Key yang Anda masukkan salah.", 3)
+            task.delay(1.5, function()
+                if submitBtn and submitBtn.Parent then
+                    submitBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
+                    submitBtn.Text = "Akses (12 Jam)"
+                end
+            end)
+        end
+    end
+
+    submitBtn.MouseButton1Click:Connect(checkKey)
+    keyBox.Text = "" 
+    
+    task.wait(0.1)
+    keyBox:CaptureFocus()
+end
+    
+-- PANGGIL SETUP KEY ACCESS PERTAMA KALI
+setupKeyAccessGUI()
+
+
+-- KONEKSI INPUT (JUMP) - FIXED Gamepad1A
+UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+    if gameProcessedEvent then return end
+    
+    -- Memeriksa Tombol SPASI ATAU Tombol A (Gamepad)
+    if IS_RECORDING and (input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.ButtonA) then
+        IS_JUMP_PRESSED = true
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gameProcessedEvent)
+    if gameProcessedEvent then return end
+    
+    -- Memeriksa Tombol SPASI ATAU Tombol A (Gamepad)
+    if IS_RECORDING and (input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.ButtonA) then
+        IS_JUMP_PRESSED = false
+    end
+end)
